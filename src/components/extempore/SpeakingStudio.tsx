@@ -171,6 +171,9 @@ export const SpeakingStudio: React.FC<SpeakingStudioProps> = ({
 
     if (isPaused) {
       recorderRef.current.resumeRecording();
+      if (recognitionRef.current) {
+        recognitionRef.current.resumeListening();
+      }
       if (sessionPausedAtRef.current !== null) {
         sessionTotalPausedMsRef.current += performance.now() - sessionPausedAtRef.current;
         sessionPausedAtRef.current = null;
@@ -179,6 +182,9 @@ export const SpeakingStudio: React.FC<SpeakingStudioProps> = ({
       startTimerInterval();
     } else {
       recorderRef.current.pauseRecording();
+      if (recognitionRef.current) {
+        recognitionRef.current.pauseListening();
+      }
       sessionPausedAtRef.current = performance.now();
       setIsPaused(true);
       if (timerIntervalRef.current) {
@@ -196,6 +202,9 @@ export const SpeakingStudio: React.FC<SpeakingStudioProps> = ({
     setLowSpeechWarning(null);
     if (recorderRef.current) {
       recorderRef.current.resumeRecording();
+    }
+    if (recognitionRef.current) {
+      recognitionRef.current.resumeListening();
     }
     if (sessionPausedAtRef.current !== null) {
       sessionTotalPausedMsRef.current += performance.now() - sessionPausedAtRef.current;
@@ -218,8 +227,12 @@ export const SpeakingStudio: React.FC<SpeakingStudioProps> = ({
 
     try {
       // 1. Stop speech recognition immediately
+      let latestCaptured = transcriptToEvaluate;
       if (recognitionRef.current) {
-        recognitionRef.current.stopListening();
+        const captured = recognitionRef.current.stopListening();
+        if (captured && captured.length > latestCaptured.length) {
+          latestCaptured = captured;
+        }
       }
 
       // 2. Stop audio recording and obtain audio metadata duration
@@ -240,6 +253,34 @@ export const SpeakingStudio: React.FC<SpeakingStudioProps> = ({
         }
       }
 
+      // 2.5 Dual-layer verification: If audio blob was captured, verify with server-side STT
+      let resolvedTranscript = latestCaptured;
+      if (audioBlob && audioBlob.size > 2000) {
+        try {
+          const formData = new FormData();
+          formData.append('file', audioBlob, 'speech.webm');
+          const transcribeRes = await fetch('/api/transcribe', {
+            method: 'POST',
+            body: formData,
+          });
+          if (transcribeRes.ok) {
+            const transcribeData = await transcribeRes.json();
+            if (transcribeData.status === 'success' && transcribeData.transcript?.trim()) {
+              const serverTranscript = transcribeData.transcript.trim();
+              const serverWords = countWords(serverTranscript);
+              const clientWords = countWords(resolvedTranscript);
+              // Use server transcript if it captured more words or if client was cut off
+              if (serverWords > clientWords || clientWords === 0) {
+                console.log(`[SpeakingStudio] Using audio transcription (${serverWords} words vs client ${clientWords} words)`);
+                resolvedTranscript = serverTranscript;
+              }
+            }
+          }
+        } catch (sttErr) {
+          console.warn('[SpeakingStudio] Audio transcription verification notice:', sttErr);
+        }
+      }
+
       // 3. Compute authoritative duration: prioritize decoded audio metadata, fallback to monotonic timer
       const monotonicDuration = getActiveElapsedSeconds();
       let authoritativeDuration = 0;
@@ -252,7 +293,7 @@ export const SpeakingStudio: React.FC<SpeakingStudioProps> = ({
       }
 
       // 4. Normalize transcript and compute metrics with shared utilities
-      const normalizedTranscript = normalizeTranscript(transcriptToEvaluate);
+      const normalizedTranscript = normalizeTranscript(resolvedTranscript);
       const wordCount = countWords(normalizedTranscript);
       const wordsPerMinute = calculateWpm(wordCount, authoritativeDuration);
 

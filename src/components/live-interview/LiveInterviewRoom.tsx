@@ -253,6 +253,19 @@ export const LiveInterviewRoom: React.FC<LiveInterviewRoomProps> = ({
     });
   };
 
+  // Toggle Pause Session
+  const handleTogglePause = () => {
+    const nextPaused = !isPaused;
+    setIsPaused(nextPaused);
+    if (recognitionService.current && isRecording) {
+      if (nextPaused) {
+        recognitionService.current.pauseListening();
+      } else {
+        recognitionService.current.resumeListening();
+      }
+    }
+  };
+
   // START Recording Candidate Answer
   const handleStartRecording = async () => {
     // 1. Critical rule: Immediately stop any AI speech before recording
@@ -437,7 +450,7 @@ export const LiveInterviewRoom: React.FC<LiveInterviewRoomProps> = ({
 
           {/* Pause / Resume */}
           <button
-            onClick={() => setIsPaused(!isPaused)}
+            onClick={handleTogglePause}
             className="p-2 rounded-lg bg-zinc-900 border border-white/[0.06] hover:bg-zinc-800 text-zinc-300 transition-colors cursor-pointer"
             title={isPaused ? 'Resume Session' : 'Pause Session'}
           >

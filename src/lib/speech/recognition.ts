@@ -14,9 +14,13 @@ export const COMMON_FILLER_WORDS = [
 export class LiveSpeechRecognitionService {
   private recognition: any = null;
   private isListening: boolean = false;
+  private isPaused: boolean = false;
   private fullTranscript: string = '';
   private lastInterim: string = '';
   private onUpdateCallback?: (update: LiveTranscriptUpdate) => void;
+  private language: string = 'en-US';
+  private restartTimer: any = null;
+  private consecutiveErrors: number = 0;
 
   public static isSupported(): boolean {
     if (typeof window === 'undefined') return false;
@@ -34,20 +38,44 @@ export class LiveSpeechRecognitionService {
       return false;
     }
 
+    this.isListening = true;
+    this.isPaused = false;
+    this.fullTranscript = '';
+    this.lastInterim = '';
+    this.onUpdateCallback = onUpdate;
+    this.language = language;
+    this.consecutiveErrors = 0;
+
+    return this.initAndStart();
+  }
+
+  private initAndStart(): boolean {
+    if (!this.isListening || this.isPaused) return false;
+
     try {
+      // Abort and unbind previous instance to avoid duplicate listeners or state collision
+      if (this.recognition) {
+        try {
+          this.recognition.onresult = null;
+          this.recognition.onerror = null;
+          this.recognition.onend = null;
+          this.recognition.abort();
+        } catch {}
+        this.recognition = null;
+      }
+
       const SpeechRecognitionConstructor =
         (window as any).SpeechRecognition || 
         (window as any).webkitSpeechRecognition;
 
-      this.recognition = new SpeechRecognitionConstructor();
-      this.recognition.continuous = true;
-      this.recognition.interimResults = true;
-      this.recognition.lang = language;
-      this.fullTranscript = '';
-      this.lastInterim = '';
-      this.onUpdateCallback = onUpdate;
+      const rec = new SpeechRecognitionConstructor();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = this.language;
+      rec.maxAlternatives = 1;
 
-      this.recognition.onresult = (event: any) => {
+      rec.onresult = (event: any) => {
+        this.consecutiveErrors = 0;
         let interim = '';
         let finalSegment = '';
 
@@ -61,44 +89,107 @@ export class LiveSpeechRecognitionService {
         }
 
         if (finalSegment) {
-          this.fullTranscript += finalSegment;
+          const combinedFull = (this.fullTranscript + ' ' + finalSegment).replace(/\s+/g, ' ').trim();
+          this.fullTranscript = combinedFull ? combinedFull + ' ' : '';
         }
 
         this.lastInterim = interim.trim();
-        const combined = (this.fullTranscript + ' ' + interim).trim();
+        const combined = (this.fullTranscript + ' ' + interim).replace(/\s+/g, ' ').trim();
         const update = this.analyzeTranscript(combined, interim);
         if (this.onUpdateCallback) {
           this.onUpdateCallback(update);
         }
       };
 
-      this.recognition.onerror = (event: any) => {
-        console.warn('Speech recognition notice:', event.error);
+      rec.onerror = (event: any) => {
+        const error = event.error;
+        console.warn('Speech recognition notice:', error);
+
+        // 'no-speech' happens when the user takes a natural breath or pause to think
+        if (error === 'no-speech' || error === 'audio-capture') {
+          return;
+        }
+
+        // Permission denied
+        if (error === 'not-allowed' || error === 'service-not-allowed') {
+          this.isListening = false;
+          return;
+        }
+
+        this.consecutiveErrors++;
       };
 
-      this.recognition.onend = () => {
-        if (this.isListening) {
-          try {
-            this.recognition.start();
-          } catch {
-            // Restart if continuous stopped unexpectedly
-          }
+      rec.onend = () => {
+        // Commit any trailing interim text so speech uttered right before cut is never lost
+        if (this.lastInterim) {
+          this.fullTranscript = (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim() + ' ';
+          this.lastInterim = '';
+        }
+
+        // Auto-reconnect if session is still active (handles Chrome's 45-60s limit and silence drops)
+        if (this.isListening && !this.isPaused) {
+          if (this.restartTimer) clearTimeout(this.restartTimer);
+          const backoff = Math.min(1000, 50 * Math.max(1, this.consecutiveErrors));
+          this.restartTimer = setTimeout(() => {
+            if (this.isListening && !this.isPaused) {
+              this.initAndStart();
+            }
+          }, backoff);
         }
       };
 
-      this.isListening = true;
-      this.recognition.start();
+      this.recognition = rec;
+      rec.start();
       return true;
     } catch (e) {
-      console.error('Failed to start SpeechRecognition', e);
+      console.warn('Failed to start SpeechRecognition session:', e);
+      if (this.isListening && !this.isPaused) {
+        if (this.restartTimer) clearTimeout(this.restartTimer);
+        this.restartTimer = setTimeout(() => {
+          if (this.isListening && !this.isPaused) {
+            this.initAndStart();
+          }
+        }, 200);
+      }
       return false;
     }
   }
 
-  public stopListening(): string {
-    this.isListening = false;
+  public pauseListening(): void {
+    this.isPaused = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     if (this.recognition) {
       try {
+        this.recognition.onend = null;
+        this.recognition.stop();
+      } catch {}
+      this.recognition = null;
+    }
+    if (this.lastInterim) {
+      this.fullTranscript = (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim() + ' ';
+      this.lastInterim = '';
+    }
+  }
+
+  public resumeListening(): void {
+    if (!this.isListening) return;
+    this.isPaused = false;
+    this.initAndStart();
+  }
+
+  public stopListening(): string {
+    this.isListening = false;
+    this.isPaused = false;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    if (this.recognition) {
+      try {
+        this.recognition.onend = null;
         this.recognition.stop();
       } catch {
         // Safe ignore
@@ -107,14 +198,14 @@ export class LiveSpeechRecognitionService {
     }
     // Include any trailing interim speech before finalizing
     if (this.lastInterim) {
-      this.fullTranscript = (this.fullTranscript + ' ' + this.lastInterim).trim();
+      this.fullTranscript = (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim();
       this.lastInterim = '';
     }
     return this.fullTranscript.trim();
   }
 
   public getCurrentTranscript(): string {
-    return (this.fullTranscript + ' ' + this.lastInterim).trim();
+    return (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim();
   }
 
   private analyzeTranscript(text: string, interimText: string): LiveTranscriptUpdate {

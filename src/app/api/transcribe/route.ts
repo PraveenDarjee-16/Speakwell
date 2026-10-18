@@ -17,9 +17,12 @@ export async function POST(req: NextRequest) {
 
     // If external Whisper API is configured
     if (apiKey && !apiKey.includes('your-openai') && !apiKey.includes('your-whisper')) {
+      const isGroq = baseUrl.includes('groq.com');
+      const whisperModel = process.env.WHISPER_MODEL || (isGroq ? 'whisper-large-v3-turbo' : 'whisper-1');
+
       const whisperFormData = new FormData();
       whisperFormData.append('file', audioFile, 'audio.webm');
-      whisperFormData.append('model', 'whisper-1');
+      whisperFormData.append('model', whisperModel);
       whisperFormData.append('language', 'en');
 
       const response = await fetch(`${baseUrl.replace(/\/$/, '')}/audio/transcriptions`, {
@@ -37,6 +40,9 @@ export async function POST(req: NextRequest) {
           source: 'whisper-api',
           status: 'success'
         });
+      } else {
+        const errorText = await response.text();
+        console.warn(`[Transcription] External provider returned ${response.status}:`, errorText);
       }
     }
 
