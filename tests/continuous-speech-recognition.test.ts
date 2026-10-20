@@ -116,8 +116,9 @@ test('Continuous Speech Recognition - Multi-session speech transcribes beyond 70
       { transcript: session1Text, isFinal: true }
     ]);
 
-    assert.ok(latestUpdate);
-    assert.equal(latestUpdate.wordCount, 69);
+    assert.ok(latestUpdate !== null);
+    const update1 = latestUpdate as unknown as LiveTranscriptUpdate;
+    assert.equal(update1.wordCount, 69);
     assert.equal(service.getCurrentTranscript(), session1Text);
 
     // Simulate Chrome's 45-60s timeout / network drop (which used to stop recognition permanently!)
@@ -146,11 +147,12 @@ test('Continuous Speech Recognition - Multi-session speech transcribes beyond 70
       { transcript: session2Text, isFinal: true }
     ]);
 
-    assert.ok(latestUpdate);
-    const totalWords = countWords(latestUpdate.transcript);
+    assert.ok(latestUpdate !== null);
+    const update2 = latestUpdate as unknown as LiveTranscriptUpdate;
+    const totalWords = countWords(update2.transcript);
     assert.ok(totalWords > 120, `Expected total word count to exceed 120 words across sessions, got ${totalWords}`);
-    assert.equal(latestUpdate.transcript.includes(session1Words[1]), true);
-    assert.equal(latestUpdate.transcript.includes(session2Words[1]), true);
+    assert.equal(update2.transcript.includes(session1Words[1]), true);
+    assert.equal(update2.transcript.includes(session2Words[1]), true);
 
     // Finalize
     const finalized = service.stopListening();
