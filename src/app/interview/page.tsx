@@ -84,7 +84,12 @@ export default function MockInterviewPage() {
   const handleStopVoice = async () => {
     setIsRecording(false);
     if (recorderRef.current) recorderRef.current.stopRecording().catch(() => {});
-    if (recognitionRef.current) recognitionRef.current.stopListening();
+    if (recognitionRef.current) {
+      const finalCaptured = recognitionRef.current.stopListening();
+      if (finalCaptured && finalCaptured.length > liveTranscript.length) {
+        setLiveTranscript(finalCaptured);
+      }
+    }
   };
 
   const handleSubmitAnswer = async () => {

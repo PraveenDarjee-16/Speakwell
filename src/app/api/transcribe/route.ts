@@ -20,8 +20,10 @@ export async function POST(req: NextRequest) {
       const isGroq = baseUrl.includes('groq.com');
       const whisperModel = process.env.WHISPER_MODEL || (isGroq ? 'whisper-large-v3-turbo' : 'whisper-1');
 
+      const fileType = (audioFile as any).type || '';
+      const filename = fileType.includes('wav') ? 'audio.wav' : 'audio.webm';
       const whisperFormData = new FormData();
-      whisperFormData.append('file', audioFile, 'audio.webm');
+      whisperFormData.append('file', audioFile, filename);
       whisperFormData.append('model', whisperModel);
       whisperFormData.append('language', 'en');
 

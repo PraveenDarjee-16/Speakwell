@@ -258,7 +258,8 @@ export const SpeakingStudio: React.FC<SpeakingStudioProps> = ({
       if (audioBlob && audioBlob.size > 2000) {
         try {
           const formData = new FormData();
-          formData.append('file', audioBlob, 'speech.webm');
+          const isWav = audioBlob.type?.includes('wav');
+          formData.append('file', audioBlob, isWav ? 'speech.wav' : 'speech.webm');
           const transcribeRes = await fetch('/api/transcribe', {
             method: 'POST',
             body: formData,

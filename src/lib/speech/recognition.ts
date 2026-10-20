@@ -15,12 +15,20 @@ export class LiveSpeechRecognitionService {
   private recognition: any = null;
   private isListening: boolean = false;
   private isPaused: boolean = false;
-  private fullTranscript: string = '';
-  private lastInterim: string = '';
+  private isExplicitlyStopped: boolean = true;
+  private isStarting: boolean = false;
+
+  // Multi-session persistent accumulation (persists across Chrome 45-60s timeouts)
+  private accumulatedTranscript: string = '';
+  private currentSessionFinal: string = '';
+  private currentSessionInterim: string = '';
+
   private onUpdateCallback?: (update: LiveTranscriptUpdate) => void;
   private language: string = 'en-US';
   private restartTimer: any = null;
+  private watchdogTimer: any = null;
   private consecutiveErrors: number = 0;
+  private lastResultTimestamp: number = 0;
 
   public static isSupported(): boolean {
     if (typeof window === 'undefined') return false;
@@ -40,33 +48,41 @@ export class LiveSpeechRecognitionService {
 
     this.isListening = true;
     this.isPaused = false;
-    this.fullTranscript = '';
-    this.lastInterim = '';
+    this.isExplicitlyStopped = false;
+    this.accumulatedTranscript = '';
+    this.currentSessionFinal = '';
+    this.currentSessionInterim = '';
     this.onUpdateCallback = onUpdate;
     this.language = language;
     this.consecutiveErrors = 0;
+    this.lastResultTimestamp = Date.now();
 
-    return this.initAndStart();
+    this.startWatchdog();
+    return this.createAndStartSession();
   }
 
-  private initAndStart(): boolean {
-    if (!this.isListening || this.isPaused) return false;
+  private createAndStartSession(): boolean {
+    if (typeof window === 'undefined') return false;
+    if (!this.isListening || this.isPaused || this.isExplicitlyStopped) {
+      return false;
+    }
+
+    if (this.isStarting) {
+      return false;
+    }
+
+    this.isStarting = true;
+    this.cleanupCurrentInstance();
 
     try {
-      // Abort and unbind previous instance to avoid duplicate listeners or state collision
-      if (this.recognition) {
-        try {
-          this.recognition.onresult = null;
-          this.recognition.onerror = null;
-          this.recognition.onend = null;
-          this.recognition.abort();
-        } catch {}
-        this.recognition = null;
-      }
-
       const SpeechRecognitionConstructor =
         (window as any).SpeechRecognition || 
         (window as any).webkitSpeechRecognition;
+
+      if (!SpeechRecognitionConstructor) {
+        this.isStarting = false;
+        return false;
+      }
 
       const rec = new SpeechRecognitionConstructor();
       rec.continuous = true;
@@ -74,45 +90,62 @@ export class LiveSpeechRecognitionService {
       rec.lang = this.language;
       rec.maxAlternatives = 1;
 
+      rec.onstart = () => {
+        this.isStarting = false;
+        this.consecutiveErrors = 0;
+        this.lastResultTimestamp = Date.now();
+      };
+
       rec.onresult = (event: any) => {
         this.consecutiveErrors = 0;
-        let interim = '';
-        let finalSegment = '';
+        this.lastResultTimestamp = Date.now();
 
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
+        let sessionFinal = '';
+        let sessionInterim = '';
+
+        for (let i = 0; i < event.results.length; ++i) {
           const item = event.results[i];
           if (item.isFinal) {
-            finalSegment += item[0].transcript + ' ';
+            sessionFinal += item[0].transcript + ' ';
           } else {
-            interim += item[0].transcript;
+            sessionInterim += item[0].transcript;
           }
         }
 
-        if (finalSegment) {
-          const combinedFull = (this.fullTranscript + ' ' + finalSegment).replace(/\s+/g, ' ').trim();
-          this.fullTranscript = combinedFull ? combinedFull + ' ' : '';
-        }
+        this.currentSessionFinal = sessionFinal.trim();
+        this.currentSessionInterim = sessionInterim.trim();
 
-        this.lastInterim = interim.trim();
-        const combined = (this.fullTranscript + ' ' + interim).replace(/\s+/g, ' ').trim();
-        const update = this.analyzeTranscript(combined, interim);
-        if (this.onUpdateCallback) {
-          this.onUpdateCallback(update);
-        }
+        this.emitUpdate();
       };
 
       rec.onerror = (event: any) => {
+        this.isStarting = false;
         const error = event.error;
         console.warn('Speech recognition notice:', error);
 
-        // 'no-speech' happens when the user takes a natural breath or pause to think
-        if (error === 'no-speech' || error === 'audio-capture') {
+        // Expected notices during user pauses, natural silence, or instance cleanup
+        if (error === 'no-speech' || error === 'audio-capture' || error === 'aborted') {
           return;
         }
 
-        // Permission denied
+        // 'network' occurs when Chrome's 45-60s Google Speech socket drops.
+        // It will trigger onend immediately after, where we seamlessly reconnect.
+        if (error === 'network') {
+          this.consecutiveErrors++;
+          return;
+        }
+
+        // Permission errors
         if (error === 'not-allowed' || error === 'service-not-allowed') {
+          // If we had already been listening or have transcribed speech, treat as temporary contention
+          if (this.accumulatedTranscript || this.currentSessionFinal) {
+            this.consecutiveErrors++;
+            return;
+          }
+          // Genuine initial permission rejection
           this.isListening = false;
+          this.isExplicitlyStopped = true;
+          this.stopWatchdog();
           return;
         }
 
@@ -120,21 +153,14 @@ export class LiveSpeechRecognitionService {
       };
 
       rec.onend = () => {
-        // Commit any trailing interim text so speech uttered right before cut is never lost
-        if (this.lastInterim) {
-          this.fullTranscript = (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim() + ' ';
-          this.lastInterim = '';
-        }
+        this.isStarting = false;
 
-        // Auto-reconnect if session is still active (handles Chrome's 45-60s limit and silence drops)
-        if (this.isListening && !this.isPaused) {
-          if (this.restartTimer) clearTimeout(this.restartTimer);
-          const backoff = Math.min(1000, 50 * Math.max(1, this.consecutiveErrors));
-          this.restartTimer = setTimeout(() => {
-            if (this.isListening && !this.isPaused) {
-              this.initAndStart();
-            }
-          }, backoff);
+        // 1. Commit whatever was in this session before it ended into persistent accumulation
+        this.commitCurrentSession();
+
+        // 2. Auto-reconnect if session is active (handles Chrome's 45-60s limit and drops)
+        if (this.isListening && !this.isPaused && !this.isExplicitlyStopped) {
+          this.scheduleRestart();
         }
       };
 
@@ -142,70 +168,159 @@ export class LiveSpeechRecognitionService {
       rec.start();
       return true;
     } catch (e) {
-      console.warn('Failed to start SpeechRecognition session:', e);
-      if (this.isListening && !this.isPaused) {
-        if (this.restartTimer) clearTimeout(this.restartTimer);
-        this.restartTimer = setTimeout(() => {
-          if (this.isListening && !this.isPaused) {
-            this.initAndStart();
-          }
-        }, 200);
+      this.isStarting = false;
+      console.warn('Speech recognition start failed, scheduling retry:', e);
+      if (this.isListening && !this.isPaused && !this.isExplicitlyStopped) {
+        this.scheduleRestart(300);
       }
       return false;
     }
   }
 
-  public pauseListening(): void {
-    this.isPaused = true;
+  private commitCurrentSession(): void {
+    const parts: string[] = [];
+    if (this.accumulatedTranscript) {
+      parts.push(this.accumulatedTranscript);
+    }
+    if (this.currentSessionFinal) {
+      parts.push(this.currentSessionFinal);
+    }
+    if (this.currentSessionInterim) {
+      // If session closed mid-utterance, retain interim speech so trailing words are never dropped
+      parts.push(this.currentSessionInterim);
+    }
+
+    const merged = parts.join(' ').replace(/\s+/g, ' ').trim();
+    this.accumulatedTranscript = merged;
+    this.currentSessionFinal = '';
+    this.currentSessionInterim = '';
+
+    // Broadcast update so UI maintains complete transcript display without stutter
+    this.emitUpdate();
+  }
+
+  private scheduleRestart(forcedDelayMs?: number): void {
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
+
+    if (!this.isListening || this.isPaused || this.isExplicitlyStopped) {
+      return;
+    }
+
+    // Exponential backoff:
+    // First reconnection attempt runs at 200ms for seamless continuation.
+    // Repeated consecutive errors escalate: 450ms, 700ms, capped at 2500ms.
+    const delay = forcedDelayMs !== undefined
+      ? forcedDelayMs
+      : Math.min(2500, 200 + Math.max(0, this.consecutiveErrors - 1) * 250);
+
+    this.restartTimer = setTimeout(() => {
+      if (this.isListening && !this.isPaused && !this.isExplicitlyStopped) {
+        this.createAndStartSession();
+      }
+    }, delay);
+  }
+
+  private startWatchdog(): void {
+    this.stopWatchdog();
+    // Heartbeat check every 6 seconds
+    this.watchdogTimer = setInterval(() => {
+      if (!this.isListening || this.isPaused || this.isExplicitlyStopped) {
+        return;
+      }
+
+      // If speech was active but no event has arrived for 40 seconds,
+      // Chrome's recognition socket may have frozen silently without firing onend.
+      const silentMs = Date.now() - this.lastResultTimestamp;
+      if (silentMs > 40000) {
+        console.log('[LiveSpeechRecognitionService] Watchdog reviving silent session.');
+        this.commitCurrentSession();
+        this.lastResultTimestamp = Date.now();
+        this.createAndStartSession();
+      }
+    }, 6000);
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private cleanupCurrentInstance(): void {
     if (this.recognition) {
       try {
+        this.recognition.onstart = null;
+        this.recognition.onresult = null;
+        this.recognition.onerror = null;
         this.recognition.onend = null;
-        this.recognition.stop();
+        try {
+          this.recognition.abort();
+        } catch {}
       } catch {}
       this.recognition = null;
     }
-    if (this.lastInterim) {
-      this.fullTranscript = (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim() + ' ';
-      this.lastInterim = '';
+  }
+
+  private emitUpdate(): void {
+    const fullText = this.getCurrentTranscript();
+    const interim = this.currentSessionInterim;
+    const update = this.analyzeTranscript(fullText, interim);
+    if (this.onUpdateCallback) {
+      this.onUpdateCallback(update);
     }
+  }
+
+  public pauseListening(): void {
+    this.isPaused = true;
+    this.stopWatchdog();
+
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+
+    this.commitCurrentSession();
+    this.cleanupCurrentInstance();
   }
 
   public resumeListening(): void {
     if (!this.isListening) return;
     this.isPaused = false;
-    this.initAndStart();
+    this.isExplicitlyStopped = false;
+    this.consecutiveErrors = 0;
+    this.lastResultTimestamp = Date.now();
+    this.startWatchdog();
+    this.createAndStartSession();
   }
 
   public stopListening(): string {
     this.isListening = false;
     this.isPaused = false;
+    this.isExplicitlyStopped = true;
+    this.isStarting = false;
+    this.stopWatchdog();
+
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
-    if (this.recognition) {
-      try {
-        this.recognition.onend = null;
-        this.recognition.stop();
-      } catch {
-        // Safe ignore
-      }
-      this.recognition = null;
-    }
-    // Include any trailing interim speech before finalizing
-    if (this.lastInterim) {
-      this.fullTranscript = (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim();
-      this.lastInterim = '';
-    }
-    return this.fullTranscript.trim();
+
+    this.commitCurrentSession();
+    this.cleanupCurrentInstance();
+
+    return this.accumulatedTranscript.trim();
   }
 
   public getCurrentTranscript(): string {
-    return (this.fullTranscript + ' ' + this.lastInterim).replace(/\s+/g, ' ').trim();
+    const parts: string[] = [];
+    if (this.accumulatedTranscript) parts.push(this.accumulatedTranscript);
+    if (this.currentSessionFinal) parts.push(this.currentSessionFinal);
+    if (this.currentSessionInterim) parts.push(this.currentSessionInterim);
+    return parts.join(' ').replace(/\s+/g, ' ').trim();
   }
 
   private analyzeTranscript(text: string, interimText: string): LiveTranscriptUpdate {
